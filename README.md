@@ -15,7 +15,9 @@ Internally, `AsyncioKeyedLock` maintains a `dict` that maps keys to regular `asy
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [API](#api)
-- [Use Case: Concurrent Batch Processing](#use-case-concurrent-batch-processing)
+- [Use Cases](#use-cases)
+  - [Concurrent Batch Processing](#concurrent-batch-processing)
+  - [Reducing Write-Concern Failures in Database Transactions](#reducing-write-concern-failures-in-database-transactions)
 - [Race Conditions in Single-Threaded asyncio](#race-conditions-in-single-threaded-asyncio)
 - [Graceful Teardown](#graceful-teardown)
 - [Development](#development)
@@ -77,7 +79,9 @@ asyncio.run(main())
 | `"key" in lock` | containment check | `True` if *key* is currently held or waited on. O(1). |
 | `await lock.wait_for_all()` | async method | Resolve the first time `active_keys_count` reaches zero. See [Graceful Teardown](#graceful-teardown). |
 
-## Use Case: Concurrent Batch Processing
+## Use Cases
+
+### Concurrent Batch Processing
 
 When consuming messages from a system like Apache Kafka, messages within a single partition are delivered in order. If you process them one at a time, per-key ordering is inherently preserved — two messages with the same key never overlap.
 
@@ -116,6 +120,53 @@ async def process_batch(messages: list[Message]) -> None:
 
     # All tasks have completed — safe to commit the batch offset.
 ```
+
+### Reducing Write-Concern Failures in Database Transactions
+
+In databases like PostgreSQL, concurrent transactions that touch the same rows can fail with serialization errors or write-concern violations — the database's mechanism for detecting conflicting writes. The standard remedy is a **retry loop, but retries carry real costs: round-trip latency, connection-pool pressure, and unnecessary rollback traffic**. When multiple coroutines within the same process operate on the same key (a user ID, an IP address, a device identifier), the collision probability is especially high. A keyed lock serialises those coroutines *before* they reach the database, eliminating intra-process conflicts entirely without sacrificing concurrency across different keys.
+
+**Example — threat-score aggregation in a SIEM pipeline.** A threat-intelligence service maintains a cumulative severity score per IP address and automatically blocks the entity once a configured threshold is crossed. Events arrive concurrently (port scans, failed authentications, etc.). When two coroutines process events for the *same* IP simultaneously, the database transaction guarantees correctness — but one of the conflicting transactions is likely to be rejected with a write-concern or serialization error, forcing a retry. A keyed lock scoped per IP address serialises these coroutines before they reach the database, reducing the frequency of such failures for same-pod traffic without sacrificing concurrency across different IP addresses.
+
+```python
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from asyncio_keyed_lock import AsyncioKeyedLock
+
+
+BLOCK_THRESHOLD = 100
+
+lock = AsyncioKeyedLock()
+
+
+async def record_security_event(
+    ip_address: str,
+    severity: int,
+    session: AsyncSession,
+) -> None:
+    async with lock(ip_address):
+        # Only one coroutine per IP is inside this block at a time.
+        # Events for different IPs are processed concurrently.
+        result = await session.execute(
+            select(ThreatProfile).where(ThreatProfile.ip_address == ip_address)
+        )
+        profile = result.scalar_one_or_none()
+
+        if profile is None:
+            profile = ThreatProfile(ip_address=ip_address, score=severity)
+            session.add(profile)
+        else:
+            profile.score += severity
+            if profile.score >= BLOCK_THRESHOLD:
+                profile.blocked = True
+                profile.blocked_at = datetime.now(timezone.utc)
+
+        await session.commit()
+```
+
+> **Important:** Using an in-memory keyed lock for this purpose is an *optimisation*, not a correctness guarantee. In replicated, stateless deployments — where multiple pods may concurrently handle events for the same IP or entity — cross-pod conflicts remain possible and the database transaction itself must ensure correctness. Cross-pod keyed locking *is* achievable (e.g., via a distributed lock backed by Redis), but it introduces additional network latency on every acquisition. An in-memory lock is therefore a practical and accepted trade-off: it eliminates intra-process contention at zero network cost, meaningfully reducing the frequency of write-concern failures and rollback traffic, as long as it is treated as an optimisation rather than a substitute for proper transaction semantics at the database level.
 
 ## Race Conditions in Single-Threaded asyncio
 

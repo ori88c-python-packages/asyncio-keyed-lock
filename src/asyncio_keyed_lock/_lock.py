@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ori Cohen https://github.com/ori88c/
+# Licensed under the Apache License 2.0.
+
 from __future__ import annotations
 
 import asyncio
